@@ -2,6 +2,7 @@ use std::fs;
 use std::fs::File;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{Parser, Subcommand};
@@ -43,6 +44,15 @@ enum Commands {
     },
     #[command(name = "write-tree")]
     WriteTree,
+    #[command(name = "commit-tree")]
+    CommitTree {
+        #[arg(value_name = "TREE_SHA")]
+        tree: String,
+        #[arg(short = 'p', value_name = "PARENT_SHA")]
+        parent: String,
+        #[arg(short = 'm', value_name = "MESSAGE")]
+        message: String,
+    },
 }
 
 struct TreeEntry {
@@ -50,6 +60,10 @@ struct TreeEntry {
     name: String,
     hash: String,
 }
+
+const DEFAULT_AUTHOR_NAME: &str = "_default";
+const DEFAULT_AUTHOR_EMAIL: &str = "default@something.com";
+const DEFAULT_TIMEZONE: &str = "+0000";
 
 fn main() {
     if let Err(err) = run() {
@@ -81,6 +95,14 @@ fn run() -> Result<()> {
         }
         Commands::WriteTree => {
             let hash = write_workdir_tree()?;
+            println!("{hash}");
+        }
+        Commands::CommitTree {
+            tree,
+            parent,
+            message,
+        } => {
+            let hash = commit_tree(&tree, &parent, &message)?;
             println!("{hash}");
         }
     }
@@ -152,6 +174,39 @@ fn ls_tree(object_hash: &str, name_only: bool) -> Result<()> {
 fn write_workdir_tree() -> Result<String> {
     let cwd = std::env::current_dir().context("determining current directory")?;
     write_tree_recursive(&cwd)
+}
+
+fn commit_tree(tree: &str, parent: &str, message: &str) -> Result<String> {
+    ensure_valid_sha(tree, "tree")?;
+    ensure_valid_sha(parent, "parent")?;
+    if message.contains('\n') {
+        bail!("commit message must be a single line");
+    }
+
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .context("system time is before UNIX epoch")?
+        .as_secs();
+
+    let mut content = String::new();
+    content.push_str(&format!("tree {tree}\n"));
+    content.push_str(&format!("parent {parent}\n"));
+    let signature = format!(
+        "{} <{}> {} {}\n",
+        DEFAULT_AUTHOR_NAME, DEFAULT_AUTHOR_EMAIL, timestamp, DEFAULT_TIMEZONE
+    );
+    content.push_str("author ");
+    content.push_str(&signature);
+    content.push_str("committer ");
+    content.push_str(&signature);
+    content.push('\n');
+    content.push_str(message);
+    content.push('\n');
+
+    let content_bytes = content.into_bytes();
+    let (object_data, hash) = build_object_data("commit", &content_bytes);
+    write_object(&hash, &object_data)?;
+    Ok(hash)
 }
 
 fn write_tree_recursive(dir: &Path) -> Result<String> {
@@ -383,4 +438,13 @@ fn build_object_data(object_type: &str, content: &[u8]) -> (Vec<u8>, String) {
     let hash = bytes_to_hex(&hash_bytes);
 
     (object_data, hash)
+}
+
+fn ensure_valid_sha(sha: &str, context: &str) -> Result<()> {
+    if sha.len() != 40 {
+        bail!("{context} hash must be 40 hex characters");
+    }
+
+    hex_to_bytes(sha).with_context(|| format!("invalid {context} hash"))?;
+    Ok(())
 }
