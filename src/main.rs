@@ -1,9 +1,9 @@
 use std::fs;
 use std::fs::File;
 use std::io::{self, Read, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
-use anyhow::{bail, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use clap::{Parser, Subcommand};
 use flate2::read::ZlibDecoder;
 use flate2::write::ZlibEncoder;
@@ -41,6 +41,8 @@ enum Commands {
         #[arg(value_name = "HASH")]
         hash: String,
     },
+    #[command(name = "write-tree")]
+    WriteTree,
 }
 
 struct TreeEntry {
@@ -77,6 +79,10 @@ fn run() -> Result<()> {
         Commands::LsTree { name_only, hash } => {
             ls_tree(&hash, name_only)?;
         }
+        Commands::WriteTree => {
+            let hash = write_workdir_tree()?;
+            println!("{hash}");
+        }
     }
 
     Ok(())
@@ -108,15 +114,7 @@ fn cat_file_print(object_hash: &str) -> Result<()> {
 fn hash_object(path: &str, write: bool) -> Result<String> {
     let file_contents = fs::read(path).with_context(|| format!("reading {path}"))?;
 
-    let header = format!("blob {}\0", file_contents.len());
-    let mut object_data = Vec::with_capacity(header.len() + file_contents.len());
-    object_data.extend_from_slice(header.as_bytes());
-    object_data.extend_from_slice(&file_contents);
-
-    let mut hasher = Sha1::new();
-    hasher.update(&object_data);
-    let hash_bytes = hasher.finalize();
-    let hash = bytes_to_hex(&hash_bytes);
+    let (object_data, hash) = build_object_data("blob", &file_contents);
 
     if write {
         write_object(&hash, &object_data)?;
@@ -149,6 +147,74 @@ fn ls_tree(object_hash: &str, name_only: bool) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn write_workdir_tree() -> Result<String> {
+    let cwd = std::env::current_dir().context("determining current directory")?;
+    write_tree_recursive(&cwd)
+}
+
+fn write_tree_recursive(dir: &Path) -> Result<String> {
+    let mut entries: Vec<TreeEntry> = Vec::new();
+    let dir_display = dir.display().to_string();
+    for entry in fs::read_dir(dir)
+        .with_context(|| format!("reading directory {dir_display}"))?
+    {
+        let entry = entry.with_context(|| format!("reading entry in {dir_display}"))?;
+        let path = entry.path();
+        let file_name = entry.file_name();
+        let name = file_name
+            .to_str()
+            .ok_or_else(|| anyhow!("file name in {} is not valid UTF-8", dir_display))?
+            .to_owned();
+
+        if name == ".git" {
+            continue;
+        }
+
+        let metadata = entry
+            .metadata()
+            .with_context(|| format!("reading metadata for {}", path.display()))?;
+        if metadata.is_dir() {
+            let hash = write_tree_recursive(&path)?;
+            entries.push(TreeEntry {
+                mode: "40000".to_string(),
+                name,
+                hash,
+            });
+        } else if metadata.is_file() {
+            let hash = write_blob(&path)?;
+            entries.push(TreeEntry {
+                mode: "100644".to_string(),
+                name,
+                hash,
+            });
+        }
+    }
+
+    entries.sort_by(|a, b| a.name.as_bytes().cmp(b.name.as_bytes()));
+
+    let mut body = Vec::new();
+    for entry in &entries {
+        body.extend_from_slice(entry.mode.as_bytes());
+        body.push(b' ');
+        body.extend_from_slice(entry.name.as_bytes());
+        body.push(0);
+        let sha_bytes = hex_to_bytes(&entry.hash)?;
+        body.extend_from_slice(&sha_bytes);
+    }
+
+    let (object_data, hash) = build_object_data("tree", &body);
+    write_object(&hash, &object_data)?;
+    Ok(hash)
+}
+
+fn write_blob(path: &Path) -> Result<String> {
+    let file_contents = fs::read(path)
+        .with_context(|| format!("reading {}", path.display()))?;
+    let (object_data, hash) = build_object_data("blob", &file_contents);
+    write_object(&hash, &object_data)?;
+    Ok(hash)
 }
 
 fn parse_tree_entries(body: &[u8]) -> Result<Vec<TreeEntry>> {
@@ -284,4 +350,37 @@ fn bytes_to_hex(bytes: &[u8]) -> String {
         encoded.push(HEX[(byte & 0x0f) as usize] as char);
     }
     encoded
+}
+
+fn hex_to_bytes(hex: &str) -> Result<Vec<u8>> {
+    if hex.len() % 2 != 0 {
+        bail!("hex string has odd length");
+    }
+
+    let mut bytes = Vec::with_capacity(hex.len() / 2);
+    for chunk in hex.as_bytes().chunks(2) {
+        let high = (chunk[0] as char)
+            .to_digit(16)
+            .with_context(|| format!("invalid hex digit '{}'", chunk[0] as char))?;
+        let low = (chunk[1] as char)
+            .to_digit(16)
+            .with_context(|| format!("invalid hex digit '{}'", chunk[1] as char))?;
+        bytes.push(((high << 4) | low) as u8);
+    }
+
+    Ok(bytes)
+}
+
+fn build_object_data(object_type: &str, content: &[u8]) -> (Vec<u8>, String) {
+    let header = format!("{object_type} {}\0", content.len());
+    let mut object_data = Vec::with_capacity(header.len() + content.len());
+    object_data.extend_from_slice(header.as_bytes());
+    object_data.extend_from_slice(content);
+
+    let mut hasher = Sha1::new();
+    hasher.update(&object_data);
+    let hash_bytes = hasher.finalize();
+    let hash = bytes_to_hex(&hash_bytes);
+
+    (object_data, hash)
 }
