@@ -1,14 +1,53 @@
-use std::env;
 use std::fs;
 use std::fs::File;
 use std::io::{self, Read, Write};
 use std::path::PathBuf;
 
 use anyhow::{bail, Context, Result};
+use clap::{Parser, Subcommand};
 use flate2::read::ZlibDecoder;
 use flate2::write::ZlibEncoder;
 use flate2::Compression;
 use sha1::{Digest, Sha1};
+
+#[derive(Parser)]
+#[command(name = "codecrafters-git", version, about = "Codecrafters Git implementation", disable_help_subcommand = true)]
+struct Cli {
+    #[command(subcommand)]
+    command: Commands,
+}
+
+#[derive(Subcommand)]
+enum Commands {
+    Init,
+    #[command(name = "cat-file")]
+    CatFile {
+        #[arg(short = 'p')]
+        pretty: bool,
+        #[arg(value_name = "HASH")]
+        hash: String,
+    },
+    #[command(name = "hash-object")]
+    HashObject {
+        #[arg(short = 'w')]
+        write: bool,
+        #[arg(value_name = "PATH")]
+        path: String,
+    },
+    #[command(name = "ls-tree")]
+    LsTree {
+        #[arg(long = "name-only")]
+        name_only: bool,
+        #[arg(value_name = "HASH")]
+        hash: String,
+    },
+}
+
+struct TreeEntry {
+    mode: String,
+    name: String,
+    hash: String,
+}
 
 fn main() {
     if let Err(err) = run() {
@@ -18,44 +57,25 @@ fn main() {
 }
 
 fn run() -> Result<()> {
-    let args: Vec<String> = env::args().collect();
-    if args.len() < 2 {
-        bail!("no command provided");
-    }
+    let cli = Cli::parse();
 
-    match args[1].as_str() {
-        "init" => {
+    match cli.command {
+        Commands::Init => {
             init_repo()?;
             println!("Initialized git directory");
         }
-        "cat-file" => {
-            if args.len() < 4 || args[2].as_str() != "-p" {
+        Commands::CatFile { pretty, hash } => {
+            if !pretty {
                 bail!("usage: cat-file -p <hash>");
             }
-            cat_file_print(&args[3])?;
+            cat_file_print(&hash)?;
         }
-        "hash-object" => {
-            if args.len() < 3 {
-                bail!("usage: hash-object [-w] <path>");
-            }
-
-            let mut arg_index = 2;
-            let mut write = false;
-            if args[arg_index].as_str() == "-w" {
-                write = true;
-                arg_index += 1;
-            }
-
-            if arg_index >= args.len() {
-                bail!("usage: hash-object [-w] <path>");
-            }
-
-            let object_path = &args[arg_index];
-            let hash = hash_object(object_path, write)?;
+        Commands::HashObject { write, path } => {
+            let hash = hash_object(&path, write)?;
             println!("{hash}");
         }
-        other => {
-            println!("unknown command: {}", other);
+        Commands::LsTree { name_only, hash } => {
+            ls_tree(&hash, name_only)?;
         }
     }
 
@@ -71,33 +91,16 @@ fn init_repo() -> Result<()> {
 }
 
 fn cat_file_print(object_hash: &str) -> Result<()> {
-    if object_hash.len() < 3 {
-        bail!("object hash must be at least 3 characters");
+    let data = read_object_bytes(object_hash)?;
+    let (object_type, _, content) = parse_object(&data)?;
+    if object_type != "blob" {
+        bail!("object {object_hash} is not a blob");
     }
 
-    let (dir, file) = object_hash.split_at(2);
-    let mut path = PathBuf::from(".git/objects");
-    path.push(dir);
-    path.push(file);
-
-    let file = File::open(&path)
-        .with_context(|| format!("opening object file at {}", path.display()))?;
-    let mut decoder = ZlibDecoder::new(file);
-    let mut decompressed = Vec::new();
-    decoder
-        .read_to_end(&mut decompressed)
-        .with_context(|| format!("decompressing object {}", object_hash))?;
-
-    let null_index = decompressed
-        .iter()
-        .position(|&byte| byte == 0)
-        .context("invalid blob: missing header")?;
-
-    let content = &decompressed[null_index + 1..];
     let mut stdout = io::stdout();
     stdout
         .write_all(content)
-        .with_context(|| format!("writing blob {} to stdout", object_hash))?;
+        .with_context(|| format!("writing blob {object_hash} to stdout"))?;
     stdout.flush().context("flushing stdout")?;
     Ok(())
 }
@@ -120,6 +123,119 @@ fn hash_object(path: &str, write: bool) -> Result<String> {
     }
 
     Ok(hash)
+}
+
+fn ls_tree(object_hash: &str, name_only: bool) -> Result<()> {
+    let data = read_object_bytes(object_hash)?;
+    let (object_type, _, body) = parse_object(&data)?;
+    if object_type != "tree" {
+        bail!("object {object_hash} is not a tree");
+    }
+
+    let entries = parse_tree_entries(body)?;
+
+    for entry in entries {
+        if name_only {
+            println!("{}", entry.name);
+        } else {
+            let object_type = if entry.mode == "40000" { "tree" } else { "blob" };
+            let mode = if entry.mode.len() < 6 {
+                format!("{:0>6}", entry.mode)
+            } else {
+                entry.mode.clone()
+            };
+            println!("{mode} {object_type} {}\t{}", entry.hash, entry.name);
+        }
+    }
+
+    Ok(())
+}
+
+fn parse_tree_entries(body: &[u8]) -> Result<Vec<TreeEntry>> {
+    let mut entries = Vec::new();
+    let mut cursor = 0usize;
+
+    while cursor < body.len() {
+        let mode_end = body[cursor..]
+            .iter()
+            .position(|&b| b == b' ')
+            .context("tree entry missing space after mode")?;
+        let mode_bytes = &body[cursor..cursor + mode_end];
+        let mode = std::str::from_utf8(mode_bytes)
+            .context("tree entry mode is not valid UTF-8")?
+            .to_string();
+        cursor += mode_end + 1; // skip space
+
+        let name_end = body[cursor..]
+            .iter()
+            .position(|&b| b == 0)
+            .context("tree entry missing null terminator after name")?;
+        let name_bytes = &body[cursor..cursor + name_end];
+        let name = std::str::from_utf8(name_bytes)
+            .context("tree entry name is not valid UTF-8")?
+            .to_string();
+        cursor += name_end + 1; // skip null terminator
+
+        if cursor + 20 > body.len() {
+            bail!("tree entry for {name} is truncated");
+        }
+        let sha_bytes = &body[cursor..cursor + 20];
+        cursor += 20;
+
+        entries.push(TreeEntry {
+            mode,
+            name,
+            hash: bytes_to_hex(sha_bytes),
+        });
+    }
+
+    Ok(entries)
+}
+
+fn read_object_bytes(object_hash: &str) -> Result<Vec<u8>> {
+    if object_hash.len() < 3 {
+        bail!("object hash must be at least 3 characters");
+    }
+
+    let (dir, file) = object_hash.split_at(2);
+    let mut path = PathBuf::from(".git/objects");
+    path.push(dir);
+    path.push(file);
+
+    let file = File::open(&path)
+        .with_context(|| format!("opening object file at {}", path.display()))?;
+    let mut decoder = ZlibDecoder::new(file);
+    let mut decompressed = Vec::new();
+    decoder
+        .read_to_end(&mut decompressed)
+        .with_context(|| format!("decompressing object {}", object_hash))?;
+    Ok(decompressed)
+}
+
+fn parse_object<'a>(data: &'a [u8]) -> Result<(&'a str, usize, &'a [u8])> {
+    let header_end = data
+        .iter()
+        .position(|&byte| byte == 0)
+        .context("object missing header terminator")?;
+    let header = std::str::from_utf8(&data[..header_end])
+        .context("object header is not valid UTF-8")?;
+    let mut parts = header.split(' ');
+    let object_type = parts
+        .next()
+        .context("object header missing type")?;
+    let size_str = parts
+        .next()
+        .context("object header missing size")?;
+    let size: usize = size_str
+        .parse()
+        .with_context(|| format!("invalid object size: {size_str}"))?;
+
+    let body = &data[header_end + 1..];
+    if body.len() != size {
+        bail!("object body size ({}) does not match header ({size})", body.len());
+    }
+
+    Ok((object_type, size, body))
 }
 
 fn write_object(object_hash: &str, data: &[u8]) -> Result<()> {
